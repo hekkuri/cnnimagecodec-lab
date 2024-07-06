@@ -1,7 +1,7 @@
 #This code is the simplest example of image compression based on neural networks
 #Comparison with JPEG is provided as well
 #It is a demonstation for Information Theory course
-#Written by Evgeny Belyaev, February 2024.
+#Written by Evgeny Belyaev, July 2024.
 import os
 import math
 import numpy
@@ -12,7 +12,12 @@ import tensorflow
 from tensorflow import keras
 from tensorflow.keras import layers
 from tensorflow.keras.models import Model
-from keras import backend as K
+#from keras import backend as K
+import tensorflow.keras.backend as K
+
+from skimage.metrics import structural_similarity as ssim
+
+#from tensorflow.keras.callbacks import ModelCheckpoint
 
 #import C-implementation of Witten&Neal&Cleary-1987 arithmetic coding as a external module
 from EntropyCodec import *
@@ -25,23 +30,25 @@ trainfolder = './train/'
 w=128
 h=128
 #If 0, then the training will be started, otherwise the model will be readed from a file
-LoadModel = 1
-#Training parameters
-batch_size = 10
+LoadModel = 0
+
 #Number of bits for representation of the layers sample in the training process
-bt = 3
-epochs = 3000
-#epochs = 100
+bt = 2
+#Training parameters 
+epochs = 2000
+#epochs = 500
+
 #Model parameters
-n1=128
-n2=32
-n3=16
+batch_sizeM1 = 24
+n1M1=128
+n2M1=32
+n3M1=16
 
 #Number of images to be compressed and shown from the test folder
 NumImagesToShow = 5
 
 #Number of bits for representation of the layers sample
-b = 3
+b = 2
 
 #Compute PSNR in RGB domain
 def PSNR_RGB(image1,image2):
@@ -95,22 +102,24 @@ def LoadImagesFromFolder (foldername):
     return x
 
 #Model training function
-def ImageCodecModel(trainfolder):
+def ImageCodecModel(trainfolder,trainwithnoise):
     input = layers.Input(shape=(w, h, 3))
     # Encoder
-    e1 = layers.Conv2D(n1, (7, 7), activation="relu", padding="same")(input)
-    e1 = layers.MaxPooling2D((2, 2), padding="same")(e1)
-    e2 = layers.Conv2D(n2, (5, 5), activation="relu", padding="same")(e1)
-    e2 = layers.MaxPooling2D((2, 2), padding="same")(e2)
-    e3 = layers.Conv2D(n3, (3, 3), activation="relu", padding="same")(e2)
-    e3 = layers.MaxPooling2D((2, 2), padding="same")(e3)
-    #add noise during training (needed for layer quantinzation)
-    e3 = e3 + tensorflow.random.uniform(tensorflow.shape(e3), 0, tensorflow.math.reduce_max(e3)/pow(2, bt+1))
-
+    e1 = layers.Conv2D(n1M1, (7, 7), activation="relu", padding="same")(input)
+    e1 = layers.AveragePooling2D((2, 2), padding="same")(e1)
+    e2 = layers.Conv2D(n2M1, (5, 5), activation="relu", padding="same")(e1)
+    e2 = layers.AveragePooling2D((2, 2), padding="same")(e2)
+    e3 = layers.Conv2D(n3M1, (3, 3), activation="relu", padding="same")(e2)
+    e3 = layers.AveragePooling2D((2, 2), padding="same")(e3)
+    layers.BatchNormalization()
+    if trainwithnoise==1:
+        maxt = tensorflow.keras.ops.max(e3)
+        e3 = e3 + maxt*keras.random.uniform(shape=(16,16,16), minval=-1.0/pow(2, bt+1), maxval=1.0/pow(2, bt+1), dtype=None, seed=None)
+    
     # Decoder
-    x = layers.Conv2DTranspose(n3, (3, 3), strides=2, activation="relu", padding="same")(e3)
-    x = layers.Conv2DTranspose(n2, (5, 5), strides=2, activation="relu", padding="same")(x)
-    x = layers.Conv2DTranspose(n1, (7, 7), strides=2, activation="relu", padding="same")(x)
+    x = layers.Conv2DTranspose(n3M1, (3, 3), strides=2, activation="relu", padding="same")(e3)
+    x = layers.Conv2DTranspose(n2M1, (5, 5), strides=2, activation="relu", padding="same")(x)
+    x = layers.Conv2DTranspose(n1M1, (7, 7), strides=2, activation="relu", padding="same")(x)
     x = layers.Conv2D(3, (3, 3), activation="sigmoid", padding="same")(x)
 
     # Autoencoder
@@ -121,17 +130,28 @@ def ImageCodecModel(trainfolder):
     autoencoder.summary()
 
     if LoadModel == 0:
+        print("Num GPUs Available: ", len(tensorflow.config.list_physical_devices('GPU')))
         xtrain = LoadImagesFromFolder(trainfolder)
         xtrain = xtrain / 255
-        autoencoder.fit(xtrain, xtrain, epochs=epochs, batch_size=batch_size,shuffle=True)
-        autoencoder.save('autoencodertemp.mdl')
-        encoder.save('encoder.mdl')
-        decoder.save('decoder.mdl')
+
+        with tensorflow.device('gpu'):    
+            autoencoder.fit(xtrain, xtrain, epochs=epochs, batch_size=batch_sizeM1,shuffle=True)
+        
+        if trainwithnoise==1:
+            encoder.save('encoder2.keras')
+            decoder.save('decoder2.keras')
+        else:
+            encoder.save('encoder.keras')
+            decoder.save('decoder.keras')
     else:
-        autoencoder = keras.models.load_model('autoencodertemp.mdl')
-        encoder = keras.models.load_model('encoder.mdl')
-        decoder = keras.models.load_model('decoder.mdl')
+        if trainwithnoise==1:
+            encoder = keras.models.load_model('encoder2.keras',safe_mode=False)
+            decoder = keras.models.load_model('decoder2.keras',safe_mode=False)
+        else:
+            encoder = keras.models.load_model('encoder.keras',safe_mode=False)
+            decoder = keras.models.load_model('decoder.keras',safe_mode=False)
     return encoder,decoder
+
 
 #Compresses input layer by multi-alphabet arithmetic coding using memoryless source model
 def EntropyEncoder (filename,enclayers,size_z,size_h,size_w):
@@ -182,21 +202,24 @@ def JPEGRDSingleImage(X,TargetBPP,i):
             realbpp=bpp
             realpsnr=psnr
             realQ = Q
+    image.save('test.jpeg', "JPEG", quality=realQ)
+    image_dec = Image.open('test.jpeg')
+    I1 = numpy.array(image.getdata()).reshape(image.size[0], image.size[1], 3)
+    I2 = numpy.array(image_dec.getdata()).reshape(image_dec.size[0], image_dec.size[1], 3)
+
+    #print('\n\n Size = ',numpy.shape(I1))
+    psnr = ssim(I1[ :, :, 0], I2[ :, :, 0],data_range=255.0)
+    psnr = psnr + ssim(I1[ :, :, 1], I2[ :, :, 1],data_range=255.0)
+    psnr = psnr + ssim(I1[ :, :, 2], I2[ :, :, 2],data_range=255.0)
+    realpsnr=psnr/3.0
     JPEGfilename = 'image%i.jpeg' % i
     image.save(JPEGfilename, "JPEG", quality=realQ)
     return realQ, realbpp, realpsnr
 
-# Main function
-if __name__ == '__main__':
-    #Load test images
-    xtest = LoadImagesFromFolder(testfolder)
-    xtest = xtest / 255
 
-    #Train the model
-    encoder, decoder = ImageCodecModel(trainfolder)
-
+def NeuralCompressor(enc,dec):
     #Run the model for first NumImagesToShow images from the test set
-    encoded_layers = encoder.predict(xtest, batch_size=NumImagesToShow)
+    encoded_layers = enc.predict(xtest, batch_size=NumImagesToShow)
     max_encoded_layers = numpy.zeros(NumImagesToShow, numpy.float16, 'C')
 
     #normalization the layer to interval [0,1)
@@ -227,38 +250,75 @@ if __name__ == '__main__':
     for i in range(NumImagesToShow):
         encoded_layers_quantized[i] = K.cast(declayers[i]*max_encoded_layers[i], "float32")
         encoded_layers[i] = K.cast(encoded_layers[i] * max_encoded_layers[i], "float32")
-    decoded_imgs = decoder.predict(encoded_layers, batch_size=NumImagesToShow)
-    decoded_imgsQ = decoder.predict(encoded_layers_quantized, batch_size=NumImagesToShow)
+    decoded_imgs = dec.predict(encoded_layers, batch_size=NumImagesToShow)
+    decoded_imgsQ = dec.predict(encoded_layers_quantized, batch_size=NumImagesToShow)
+    return bpp, decoded_imgs, decoded_imgsQ
+   
+
+# Main function
+if __name__ == '__main__':
+    #Load test images
+    xtest = LoadImagesFromFolder(testfolder)
+    xtest = xtest / 255
+
+    #Train/load the model
+    encoder, decoder = ImageCodecModel(trainfolder,0)
+    encoder2, decoder2 = ImageCodecModel(trainfolder,1)
+    
+    bpp, decoded_imgs, decoded_imgsQ = NeuralCompressor(encoder,decoder)  
+    bpp2, decoded_imgs2, decoded_imgsQ2 = NeuralCompressor(encoder2,decoder2)    
 
     #Shows NumImagesToShow images from the test set
     #For each image the following results are presented
-    #Original image
-    #Image, represented by the model (without quantization)
-    #Image, represented by the model with quantization and compression of the layers samples
+    #Original image (RAW)
+    #Image, represented by the model (without noise additing during training)
+    #Image, represented by the model (with noise additing during training)
     #Corresponding JPEG image at the same compression level
+    #Q is the quality metric measured as SSIM
+    #bpp is bit per pixel after compression (bpp for RAW data is 24 bpp)
     for i in range(NumImagesToShow):
-        title = ''
-        plt.subplot(4, NumImagesToShow, i + 1).set_title(title, fontsize=10)
-        plt.imshow(xtest[i, :, :, :], interpolation='nearest')
-        plt.axis(False)
+            title=''
+            plt.subplot(4, NumImagesToShow, i + 1).set_title(title, fontsize=10)
+            if i==0:
+                plt.subplot(4, NumImagesToShow, i + 1).text(-50, 64, 'RAW')
+            plt.imshow(xtest[i, :, :, :], interpolation='nearest')
+            plt.axis(False)
     for i in range(NumImagesToShow):
-        psnr = PSNR(xtest[i, :, :, :], decoded_imgs[i, :, :, :])
-        title = '%2.2f' % psnr
+        #psnr = PSNR(xtest[i, :, :, :], decoded_imgsQ[i, :, :, :])
+        psnr = ssim(xtest[i, :, :, 0], decoded_imgsQ[i, :, :, 0],data_range=1.0)
+        psnr = psnr + ssim(xtest[i, :, :, 1], decoded_imgsQ[i, :, :, 1],data_range=1.0)
+        psnr = psnr + ssim(xtest[i, :, :, 2], decoded_imgsQ[i, :, :, 2],data_range=1.0)
+        psnr=psnr/3.0
+
+        #title = '%2.2f %2.2f' % (psnr, bpp[i])
+        title = 'Q=%2.2f bpp=%2.2f' % (psnr, bpp[i])
         plt.subplot(4, NumImagesToShow, NumImagesToShow + i + 1).set_title(title, fontsize=10)
-        plt.imshow(decoded_imgs[i, :, :, :], interpolation='nearest')
+        if i==0:
+            plt.subplot(4, NumImagesToShow, NumImagesToShow + i + 1).text(-50, 64, 'AE1')        
+        plt.imshow(decoded_imgsQ[i, :, :, :], interpolation='nearest')
         plt.axis(False)
     for i in range(NumImagesToShow):
-        psnr = PSNR(xtest[i, :, :, :], decoded_imgsQ[i, :, :, :])
-        title = '%2.2f %2.2f' % (psnr, bpp[i])
+        #psnr = PSNR(xtest[i, :, :, :], decoded_imgsQ2[i, :, :, :])
+        psnr = ssim(xtest[i, :, :, 0], decoded_imgsQ2[i, :, :, 0],data_range=1.0)
+        psnr = psnr + ssim(xtest[i, :, :, 1], decoded_imgsQ2[i, :, :, 1],data_range=1.0)
+        psnr = psnr + ssim(xtest[i, :, :, 2], decoded_imgsQ2[i, :, :, 2],data_range=1.0)
+        psnr=psnr/3.0
+        #title = '%2.2f %2.2f' % (psnr, bpp2[i])
+        title = 'Q=%2.2f bpp=%2.2f' % (psnr, bpp2[i])
         plt.subplot(4, NumImagesToShow, 2*NumImagesToShow + i + 1).set_title(title, fontsize=10)
-        plt.imshow(decoded_imgsQ[i, :, :, :], interpolation='nearest')
+        if i==0:
+            plt.subplot(4, NumImagesToShow, 2*NumImagesToShow + i + 1).text(-50, 64, 'AE2')        
+        plt.imshow(decoded_imgsQ2[i, :, :, :], interpolation='nearest')
         plt.axis(False)
     for i in range(NumImagesToShow):
         JPEGQP,JPEGrealbpp, JPEGrealpsnr = JPEGRDSingleImage(xtest[i, :, :, :], bpp[i],i)
         JPEGfilename = 'image%i.jpeg' % i
         JPEGimage = Image.open(JPEGfilename)
-        title = '%2.2f %2.2f' % (JPEGrealpsnr,JPEGrealbpp)
+        #title = '%2.2f %2.2f' % (JPEGrealpsnr,JPEGrealbpp)
+        title = 'Q=%2.2f bpp=%2.2f' % (JPEGrealpsnr,JPEGrealbpp)
         plt.subplot(4, NumImagesToShow, 3*NumImagesToShow + i + 1).set_title(title, fontsize=10)
+        if i==0:
+            plt.subplot(4, NumImagesToShow, 3*NumImagesToShow + i + 1).text(-50, 64, 'JPEG')        
         plt.imshow(JPEGimage, interpolation='nearest')
         plt.axis(False)
     plt.show()
