@@ -1,7 +1,7 @@
 #This code is the simplest example of image compression based on neural networks
 #Comparison with JPEG is provided as well
 #It is a demonstation for Information Theory course
-#Written by Evgeny Belyaev, July 2024.
+#Written by Evgeny Belyaev, December 2025.
 import os
 import math
 import numpy
@@ -113,39 +113,76 @@ def LoadImagesFromFolder (foldername):
             N = N + 1
     return x
 
-#Model training function
-def ImageCodecModel(trainfolder,trainwithnoise):
+def residual_block(input_tensor, filters, kernel_size=(3, 3), strides=1, downsample=False):
+    #Residual block with optional downsampling and channel adjustment
+    x = layers.Conv2D(filters, kernel_size, strides=strides, padding='same')(input_tensor)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation('relu')(x)
+
+    x = layers.Conv2D(filters, kernel_size, padding='same')(x)
+    x = layers.BatchNormalization()(x)
+
+    # Adjust skip connection if needed
+    if downsample or input_tensor.shape[-1] != filters:
+        skip = layers.Conv2D(filters, (1, 1), strides=strides, padding='same')(input_tensor)
+        skip = layers.BatchNormalization()(skip)
+    else:
+        skip = input_tensor
+
+    x = layers.Add()([x, skip])
+    return layers.Activation('relu')(x)
+
+
+def ImageCodecModel(trainfolder, trainwithnoise):
     input = layers.Input(shape=(w, h, 3))
-    # Encoder
-    e1 = layers.Conv2D(n1M1, (7, 7), activation="relu", padding="same")(input)
-    e1 = layers.AveragePooling2D((2, 2), padding="same")(e1)
-    e2 = layers.Conv2D(n2M1, (5, 5), activation="relu", padding="same")(e1)
-    e2 = layers.AveragePooling2D((2, 2), padding="same")(e2)
-    #e3 = layers.Conv2D(n3M1, (3, 3), activation="tanh", padding="same")(e2)
-    e3 = layers.Conv2D(n3M1, (3, 3), activation="relu", padding="same")(e2)
-    e3 = layers.AveragePooling2D((2, 2), padding="same")(e3)
-    if trainwithnoise==1:
-        maxt = tensorflow.reduce_max(e3)
+    #Encoder
+    x = layers.Conv2D(n1M1, (7, 7), padding='same')(input)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation('relu')(x)
+    x = residual_block(x, n1M1, kernel_size=(5, 5))
+    x = layers.AveragePooling2D((2, 2), padding='same')(x)
+    x = residual_block(x, n2M1, kernel_size=(5, 5))
+    x = layers.AveragePooling2D((2, 2), padding='same')(x)
+
+    x = residual_block(x, n3M1, kernel_size=(3, 3))
+    encoder_output = layers.AveragePooling2D((2, 2), padding='same')(x)
+
+    # Add noise during training to simulate quantization
+    if trainwithnoise == 1:
+        max_val = tensorflow.reduce_max(encoder_output)
         noise = tensorflow.random.uniform(
-            shape=tensorflow.shape(e3),
-            minval=-1.0 / pow(2, bt + 1),
-            maxval=1.0 / pow(2, bt + 1),
+            shape=tensorflow.shape(encoder_output),
+            minval=-1.0 / (2 ** (bt + 1)),
+            maxval=1.0 / (2 ** (bt + 1)),
             dtype=tensorflow.float32
         )
-        e3 = e3 + maxt * noise
+        decoder_input = encoder_output + max_val * noise
+    else:
+        decoder_input = encoder_output
 
-    
     # Decoder
-    x = layers.Conv2DTranspose(n3M1, (3, 3), strides=2, activation="relu", padding="same")(e3)
-    x = layers.Conv2DTranspose(n2M1, (5, 5), strides=2, activation="relu", padding="same")(x)
-    x = layers.Conv2DTranspose(n1M1, (7, 7), strides=2, activation="relu", padding="same")(x)
-    x = layers.Conv2D(3, (3, 3), activation="sigmoid", padding="same")(x)
+    x = layers.UpSampling2D(size=(2, 2))(decoder_input)
+    x = layers.Conv2D(n3M1, (3, 3), padding='same')(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation('relu')(x)
 
-    # Autoencoder
-    encoder = Model(input, e3)
-    decoder = Model(e3, x)
-    autoencoder = Model(input, x)
-    autoencoder.compile(optimizer="adam", loss='mean_squared_error')
+    x = layers.UpSampling2D(size=(2, 2))(x)
+    x = layers.Conv2D(n2M1, (5, 5), padding='same')(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation('relu')(x)
+
+    x = layers.UpSampling2D(size=(2, 2))(x)
+    x = layers.Conv2D(n1M1, (7, 7), padding='same')(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation('relu')(x)
+
+    output = layers.Conv2D(3, (3, 3), activation='sigmoid', padding='same')(x)
+
+    encoder = Model(input, encoder_output, name='encoder')
+    decoder = Model(decoder_input, output, name='decoder')
+    autoencoder = Model(input, output, name='autoencoder')
+
+    autoencoder.compile(optimizer='adam', loss='mean_squared_error')
     autoencoder.summary()
 
     if LoadModel == 0:
