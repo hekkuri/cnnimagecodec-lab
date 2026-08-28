@@ -1,7 +1,8 @@
 #This code is the simplest example of image compression based on neural networks
 #Comparison with JPEG is provided as well
 #It is a demonstation for Information Theory course
-#Written by Evgeny Belyaev, December 2025.
+#Written by Evgeny Belyaev, August 2026.
+import sys
 import os
 import math
 import numpy
@@ -14,15 +15,13 @@ from tensorflow.keras import layers
 from tensorflow.keras.models import Model
 #from keras import backend as K
 import tensorflow.keras.backend as K
-
 from skimage.metrics import structural_similarity as ssim
+import numpy as np
+from RangeCoder import ArithmeticEncoder, ArithmeticDecoder
+from bj_delta import *
+from tensorflow.keras.callbacks import EarlyStopping
 
-#from tensorflow.keras.callbacks import ModelCheckpoint
-
-#import C-implementation of Witten&Neal&Cleary-1987 arithmetic coding as a external module
-from EntropyCodec import *
-
-# Ограничить использование GPU памяти (не резервировать всю сразу)
+# Restrict GPU memory use
 gpus = tensorflow.config.experimental.list_physical_devices('GPU')
 if gpus:
     try:
@@ -41,13 +40,10 @@ w=128
 h=128
 #If 0, then the training will be started, otherwise the model will be readed from a file
 LoadModel = 1
-
 #Number of bits for representation of the layers sample in the training process
 bt = 2
 #Training parameters 
 epochs = 2000
-#epochs = 500
-
 #Model parameters
 batch_sizeM1 = 24
 n1M1=128
@@ -61,6 +57,13 @@ NumImagesToShow = 5
 
 #Number of bits for representation of the layers sample
 b = 2
+
+#Range coder variables
+ALPHABET_SIZE = pow(2, b)   
+CONTEX_SIZE = ALPHABET_SIZE*n3M1 
+freqs = np.ones((CONTEX_SIZE, ALPHABET_SIZE+1), dtype=np.int64)
+cumfreqs = np.zeros(ALPHABET_SIZE+1,  dtype=np.int64)
+MAX_FREQ_SUM=4096
 
 #Compute PSNR in RGB domain
 def PSNR_RGB(image1,image2):
@@ -106,11 +109,12 @@ def LoadImagesFromFolder (foldername):
         if filetype is None:
             print('Unknown image format for file: ', name)
         else:
-            print('Progress: N = %i' % N)
+            print('\rProgress: N = %i' % N, end='')
             image = Image.open(fullname)
             I1 = numpy.array(image.getdata()).reshape(image.size[0], image.size[1], 3)
             x[N, :, :, :] = I1
             N = N + 1
+    print()
     return x
 
 def residual_block(input_tensor, filters, kernel_size=(3, 3), strides=1, downsample=False):
@@ -132,8 +136,7 @@ def residual_block(input_tensor, filters, kernel_size=(3, 3), strides=1, downsam
     x = layers.Add()([x, skip])
     return layers.Activation('relu')(x)
 
-
-def ImageCodecModel(trainfolder, trainwithnoise):
+def ImageCodecModel(trainfolder, trainwithnoise,btrain):
     input = layers.Input(shape=(w, h, 3))
     #Encoder
     x = layers.Conv2D(n1M1, (7, 7), padding='same')(input)
@@ -152,8 +155,8 @@ def ImageCodecModel(trainfolder, trainwithnoise):
         max_val = tensorflow.reduce_max(encoder_output)
         noise = tensorflow.random.uniform(
             shape=tensorflow.shape(encoder_output),
-            minval=-1.0 / (2 ** (bt + 1)),
-            maxval=1.0 / (2 ** (bt + 1)),
+            minval=-1.0 / (2 ** (btrain + 1)),
+            maxval=1.0 / (2 ** (btrain + 1)),
             dtype=tensorflow.float32
         )
         decoder_input = encoder_output + max_val * noise
@@ -185,58 +188,89 @@ def ImageCodecModel(trainfolder, trainwithnoise):
     autoencoder.compile(optimizer='adam', loss='mean_squared_error')
     autoencoder.summary()
 
+    encname = './models/encoder_%i_%i.h5' % (trainwithnoise,btrain)
+    decname = './models/decoder_%i_%i.h5' % (trainwithnoise,btrain)
+
     if LoadModel == 0:
         print("Num GPUs Available: ", len(tensorflow.config.list_physical_devices('GPU')))
         xtrain = LoadImagesFromFolder(trainfolder)
         xtrain = xtrain / 255
-
         with tensorflow.device('gpu'):    
-            autoencoder.fit(xtrain, xtrain, epochs=epochs, batch_size=batch_sizeM1,shuffle=True)
-        
-        if trainwithnoise==1:
-            encoder.save('encoder2.h5')
-            decoder.save('decoder2.h5')
-        else:
-            encoder.save('encoder.h5')
-            decoder.save('decoder.h5')
+            history = autoencoder.fit(
+                xtrain, xtrain,
+                epochs=epochs,
+                batch_size=batch_sizeM1,
+                shuffle=True
+            )
+        encoder.save(encname)
+        decoder.save(decname)
     else:
-        if trainwithnoise==1:
-            encoder = keras.models.load_model('encoder2.h5')
-            decoder = keras.models.load_model('decoder2.h5')
-        else:
-            encoder = keras.models.load_model('encoder.h5')
-            decoder = keras.models.load_model('decoder.h5')
+        encoder = keras.models.load_model(encname)
+        decoder = keras.models.load_model(decname)
+            
     return encoder,decoder
 
+def initfreqs():
+    for i in range(CONTEX_SIZE):
+        for j in range(ALPHABET_SIZE):
+            freqs[i][j] = 1
+        freqs[i][ALPHABET_SIZE]=ALPHABET_SIZE    
+    
+def encode_symbol(enc, symbol, history):
+    freq_dict = freqs[history]
+    #print(symbol)
+    #print(freq_dict)
+    enc.write(freq_dict, symbol, ALPHABET_SIZE)
+    freqs[history][symbol] = freqs[history][symbol]+1
+    freqs[history][ALPHABET_SIZE] = freqs[history][ALPHABET_SIZE]+1
+    #if freqs[history].sum() > MAX_FREQ_SUM:
+    #    freqs[history] = np.maximum(freqs[history] // 2, 1)
+
+def decode_symbol(dec, history):
+    freq_dict = freqs[history]
+    cum = 0
+    for i in range(ALPHABET_SIZE):
+        cumfreqs[i] = cum
+        cum += freq_dict[i]
+    cumfreqs[ALPHABET_SIZE] = cum
+    symbol =  dec.read(freq_dict, cumfreqs, ALPHABET_SIZE)
+    #print(symbol)
+    freqs[history][symbol] = freqs[history][symbol]+1
+    #if freqs[history].sum() > MAX_FREQ_SUM:
+    #    freqs[history] = np.maximum(freqs[history] // 2, 1) 
+    return symbol
 
 #Compresses input layer by multi-alphabet arithmetic coding using memoryless source model
 def EntropyEncoder (filename,enclayers,size_z,size_h,size_w):
-    temp = numpy.zeros((size_z, size_h, size_w), numpy.uint8, 'C')
-    for z in range(size_z):
-        for h in range(size_h):
-            for w in range(size_w):
-                temp[z][h][w] = enclayers[z][h][w]
-    maxbinsize = (size_h * size_w * size_z)
-    bitstream = numpy.zeros(maxbinsize, numpy.uint8, 'C')
-    StreamSize = numpy.zeros(1, numpy.int32, 'C')
-    HiddenLayersEncoder(temp, size_w, size_h, size_z, bitstream, StreamSize)
-    name = filename
-    path = './'
-    fp = open(os.path.join(path, name), 'wb')
-    out = bitstream[0:StreamSize[0]]
-    out.astype('uint8').tofile(fp)
-    fp.close()
+    initfreqs()
+    with open(filename, "wb") as out:
+        enc = ArithmeticEncoder(16, out)
+        # Инициализация истории последних MAX_ORDER символов (заполняем нулями)
+        history = 0
+        for z in range(size_z):
+            for h in range(size_h):
+                for w in range(size_w):
+                    symbol = int(enclayers[z][h][w])
+                    context = n3M1*history+w
+                    encode_symbol(enc, symbol, context)
+                    # Обновляем историю: удаляем первый элемент и добавляем новый символ
+                    history = symbol
+        enc.finish()
 
 #Decompresses input layer by multi-alphabet arithmetic coding using memoryless source model
 def EntropyDecoder (filename,size_z,size_h,size_w):
-    fp = open(filename, 'rb')
-    bitstream = fp.read()
-    fp.close()
-    bitstream = numpy.frombuffer(bitstream, dtype=numpy.uint8)
+    initfreqs()
     declayers = numpy.zeros((size_z, size_h, size_w), numpy.uint8, 'C')
-    FrameOffset = numpy.zeros(1, numpy.int32, 'C')
-    FrameOffset[0] = 0
-    HiddenLayersDecoder(declayers, size_w, size_h, size_z, bitstream, FrameOffset)
+    with open(filename, "rb") as inp:
+        dec = ArithmeticDecoder(16, inp)
+        history = 0
+        for z in range(size_z):
+            for h in range(size_h):
+                for w in range(size_w):
+                    context = n3M1*history+w
+                    symbol = decode_symbol(dec, context)
+                    declayers[z][h][w]=symbol
+                    history = symbol
     return declayers
 
 #This function is searching for the JPEG quality factor (QF)
@@ -254,6 +288,10 @@ def JPEGRDSingleImage(X,TargetBPP,i):
         bytesize = os.path.getsize('test.jpeg')
         bpp = bytesize*8/(width*height)
         psnr = PSNR_RGB(image, image_dec)
+        if Q==0:
+            realbpp=bpp
+            realpsnr=psnr
+            realQ = Q
         if abs(realbpp-TargetBPP)>abs(bpp-TargetBPP):
             realbpp=bpp
             realpsnr=psnr
@@ -268,11 +306,11 @@ def JPEGRDSingleImage(X,TargetBPP,i):
     psnr = psnr + ssim(I1[ :, :, 1], I2[ :, :, 1],data_range=255.0)
     psnr = psnr + ssim(I1[ :, :, 2], I2[ :, :, 2],data_range=255.0)
     realpsnr=psnr/3.0
-    JPEGfilename = 'image%i.jpeg' % i
+    JPEGfilename = './jpg/image%i.jpeg' % i
     image.save(JPEGfilename, "JPEG", quality=realQ)
     return realQ, realbpp, realpsnr
 
-def NeuralCompressor(enc,dec):
+def NeuralCompressor(enc,dec,btest):
     #Run the model for first NumImagesToCompress images from the test set
     encoded_layers = enc.predict(xtest, batch_size=NumImagesToCompress)
     max_encoded_layers = numpy.zeros(NumImagesToCompress, numpy.float16, 'C')
@@ -284,30 +322,29 @@ def NeuralCompressor(enc,dec):
 
     #Quantization of layer to b bits
     encoded_layers1 = numpy.clip(encoded_layers, 0, 0.9999999)
-    encoded_layers1 = K.cast(encoded_layers1*pow(2, b), "int32")
+    encoded_layers1 = K.cast(encoded_layers1*pow(2, btest), "int32")
 
     #Encoding and decoding of each quantized layer by arithmetic coding
     bpp = numpy.zeros(NumImagesToCompress, numpy.float16, 'C')
-    declayers = numpy.zeros((NumImagesToCompress,16, 16, 16), numpy.uint8, 'C')
+    declayers = numpy.zeros((NumImagesToCompress,n3M1, n3M1, n3M1), numpy.uint8, 'C')
     for i in range(NumImagesToCompress):
-        binfilename = 'image%i.bin' % i
-        EntropyEncoder(binfilename, encoded_layers1[i], 16, 16, 16)
+        binfilename = './bin/image%i.bin' % i
+        EntropyEncoder(binfilename, encoded_layers1[i], n3M1, n3M1, n3M1)
         bytesize = os.path.getsize(binfilename)
         bpp[i] = bytesize * 8 / (w * h)
-        declayers[i] = EntropyDecoder(binfilename,  16, 16, 16)
+        declayers[i] = EntropyDecoder(binfilename,  n3M1, n3M1, n3M1)
 
     #Dequantization and denormalization of each layer
-    print(bpp)
-    shift = 1.0/pow(2, b+1)
-    declayers = K.cast(declayers, "float32") / pow(2, b)
+    #print(bpp)
+    shift = 1.0/pow(2, btest+1)
+    declayers = K.cast(declayers, "float32") / pow(2, btest)
     declayers = declayers + shift
-    encoded_layers_quantized = numpy.zeros((NumImagesToCompress, 16, 16, 16), numpy.double, 'C')
+    encoded_layers_quantized = numpy.zeros((NumImagesToCompress, n3M1, n3M1, n3M1), numpy.double, 'C')
     for i in range(NumImagesToCompress):
         encoded_layers_quantized[i] = K.cast(declayers[i]*max_encoded_layers[i], "float32")
         encoded_layers[i] = K.cast(encoded_layers[i] * max_encoded_layers[i], "float32")
-    decoded_imgs = dec.predict(encoded_layers, batch_size=NumImagesToCompress)
     decoded_imgsQ = dec.predict(encoded_layers_quantized, batch_size=NumImagesToCompress)
-    return bpp, decoded_imgs, decoded_imgsQ
+    return bpp, decoded_imgsQ
    
 
 # Main function
@@ -316,87 +353,120 @@ if __name__ == '__main__':
     xtest = LoadImagesFromFolder(testfolder)
     xtest = xtest / 255
 
-    #Train/load the model
-    encoder, decoder = ImageCodecModel(trainfolder,0)
-    encoder2, decoder2 = ImageCodecModel(trainfolder,1)
-    
-    bpp, decoded_imgs, decoded_imgsQ = NeuralCompressor(encoder,decoder)  
-    bpp2, decoded_imgs2, decoded_imgsQ2 = NeuralCompressor(encoder2,decoder2)
+    #btrainarray = np.array([1, 2, 3, 4])
+    btrainarray = np.array([2])
+    LoadModel = 1
+    if LoadModel==0:
+    #Обучение всех моделей    
+        #Train/load the model
+        for i in range(len(btrainarray)):
+            encoder, decoder = ImageCodecModel(trainfolder,1,btrainarray[i])
+    LoadModel = 1
 
+    QJPEG   = np.zeros(4)
+    QAE     = np.zeros(4)
+    bppJPEG = np.zeros(4)
+    bppAE   = np.zeros(4)
+    k = 0
+    btrain=2
+    for btrain in range(1,5):
+        btest = btrain
+        #Range coder variables
+        ALPHABET_SIZE = pow(2, btest)   
+        CONTEX_SIZE = ALPHABET_SIZE*n3M1 
+        freqs = np.ones((CONTEX_SIZE, ALPHABET_SIZE+1), dtype=np.int64)
+        cumfreqs = np.zeros(ALPHABET_SIZE+1,  dtype=np.int64)
 
-    print('#i\tbpp\tQ\tJPEGbpp\tJPEGQ')
-    BPPAve = 0;
-    QAve = 0;
-    BPPAveJPEG = 0;
-    QAveJPEG = 0;
-    for i in range(NumImagesToCompress):
-        ssim2=0;
-        ssim2 = ssim(xtest[i, :, :, 0], decoded_imgsQ2[i, :, :, 0], data_range=1.0)
-        ssim2 = ssim2 + ssim(xtest[i, :, :, 1], decoded_imgsQ2[i, :, :, 1], data_range=1.0)
-        ssim2 = ssim2 + ssim(xtest[i, :, :, 2], decoded_imgsQ2[i, :, :, 2], data_range=1.0)
-        ssim2 = ssim2 / 3.0
-        JPEGQP, JPEGrealbpp, JPEGrealssim = JPEGRDSingleImage(xtest[i, :, :, :], bpp2[i], i)
-        BPPAve = BPPAve+bpp2[i];
-        QAve = QAve + ssim2;
-        BPPAveJPEG = BPPAveJPEG+JPEGrealbpp;
-        QAveJPEG = QAveJPEG + JPEGrealssim;
-        print("#%i\t%.3f\t%.3f\t%.3f\t%.3f" % (i,bpp2[i],ssim2,JPEGrealbpp,JPEGrealssim))
-    print("Average: %.3f\t%.3f\t%.3f\t%.3f\n" % (BPPAve/NumImagesToCompress,QAve/NumImagesToCompress,BPPAveJPEG/NumImagesToCompress,QAveJPEG/NumImagesToCompress))
+        original_stdout = sys.stdout
+        sys.stdout = open(os.devnull, 'w')
+        encoder, decoder = ImageCodecModel(trainfolder,1,btrain)
+        sys.stdout = original_stdout
+        bpp, decoded_imgsQ = NeuralCompressor(encoder,decoder,btest)
+        
+        print('btrain = %i, btest = %i,' % (btrain,btest))
+        print('#i\tbpp\tQ\tJPEGbpp\tJPEGQ')
+        BPPAve = 0;
+        QAve = 0;
+        BPPAveJPEG = 0;
+        QAveJPEG = 0;
+        for i in range(NumImagesToCompress):
+            ssim2=0;
+            ssim2 = ssim(xtest[i, :, :, 0], decoded_imgsQ[i, :, :, 0], data_range=1.0)
+            ssim2 = ssim2 + ssim(xtest[i, :, :, 1], decoded_imgsQ[i, :, :, 1], data_range=1.0)
+            ssim2 = ssim2 + ssim(xtest[i, :, :, 2], decoded_imgsQ[i, :, :, 2], data_range=1.0)
+            ssim2 = ssim2 / 3.0
+            JPEGQP, JPEGrealbpp, JPEGrealssim = JPEGRDSingleImage(xtest[i, :, :, :], bpp[i], i)
+            BPPAve = BPPAve+bpp[i];
+            QAve = QAve + ssim2;
+            BPPAveJPEG = BPPAveJPEG+JPEGrealbpp;
+            QAveJPEG = QAveJPEG + JPEGrealssim;
+            print("#%i\t%.3f\t%.3f\t%.3f\t%.3f" % (i,bpp[i],ssim2,JPEGrealbpp,JPEGrealssim))
+        print("Average: %.3f\t%.3f\t%.3f\t%.3f\n" % (BPPAve/NumImagesToCompress,QAve/NumImagesToCompress,BPPAveJPEG/NumImagesToCompress,QAveJPEG/NumImagesToCompress))
+        QJPEG[k]   = QAveJPEG/NumImagesToCompress
+        QAE[k]     = QAve/NumImagesToCompress
+        bppJPEG[k] = BPPAveJPEG/NumImagesToCompress
+        bppAE[k]   = BPPAve/NumImagesToCompress
+        k = k + 1
 
+    plt.figure(figsize=(10, 6))
+    plt.plot(bppJPEG, QJPEG, label="JPEG", color="blue", linewidth=2, marker="o")
+    plt.plot(bppAE, QAE, label="AE", color="red", linewidth=2, marker="o")
+    plt.xlabel("bpp", fontsize=12)
+    plt.ylabel("SSIM", fontsize=12)
+    #plt.title("Сравнение зависимости SSIM от bpp для JPEG и AE", fontsize=14)
+    plt.grid(True, linestyle="--", alpha=0.7) # Включаем сетку
+    plt.legend(fontsize=11)
+    plt.savefig("rd-performance.png", dpi=300, bbox_inches="tight")
+    plt.close()
 
+    BDRate = bj_delta(bppJPEG, QJPEG, bppAE, QAE, mode=0)
+    print("BD-Rate = %.3f" % (BDRate))
+    BDRate = bj_delta(bppJPEG, QJPEG, bppAE, QAE, mode=1)
+    print("BD-Rate = %.3f" % (BDRate))
+   
 
-    if 1:
+    VusualComparison = 1
+    if VusualComparison==1:
         #Shows NumImagesToShow images from the test set
         #For each image the following results are presented
         #Original image (RAW)
-        #Image, represented by the model (without noise additing during training)
         #Image, represented by the model (with noise additing during training)
         #Corresponding JPEG image at the same compression level
         #Q is the quality metric measured as SSIM
         #bpp is bit per pixel after compression (bpp for RAW data is 24 bpp)
+        btest = 2
+        LoadModel = 1
+        original_stdout = sys.stdout
+        sys.stdout = open(os.devnull, 'w')
+        encoder, decoder = ImageCodecModel(trainfolder,1,btest)
+        sys.stdout = original_stdout
+        bpp, decoded_imgsQ = NeuralCompressor(encoder,decoder,btest)
         for i in range(NumImagesToShow):
                 title=''
-                plt.subplot(4, NumImagesToShow, i + 1).set_title(title, fontsize=10)
+                plt.subplot(3, NumImagesToShow, i + 1).set_title(title, fontsize=10)
                 if i==0:
-                    plt.subplot(4, NumImagesToShow, i + 1).text(-50, 64, 'RAW')
+                    plt.subplot(3, NumImagesToShow, i + 1).text(-50, 64, 'RAW')
                 plt.imshow(xtest[i, :, :, :], interpolation='nearest')
                 plt.axis(False)
         for i in range(NumImagesToShow):
-            #psnr = PSNR(xtest[i, :, :, :], decoded_imgsQ[i, :, :, :])
             psnr = ssim(xtest[i, :, :, 0], decoded_imgsQ[i, :, :, 0],data_range=1.0)
             psnr = psnr + ssim(xtest[i, :, :, 1], decoded_imgsQ[i, :, :, 1],data_range=1.0)
             psnr = psnr + ssim(xtest[i, :, :, 2], decoded_imgsQ[i, :, :, 2],data_range=1.0)
             psnr=psnr/3.0
-
-            #title = '%2.2f %2.2f' % (psnr, bpp[i])
             title = 'Q=%2.2f bpp=%2.2f' % (psnr, bpp[i])
-            plt.subplot(4, NumImagesToShow, NumImagesToShow + i + 1).set_title(title, fontsize=10)
+            plt.subplot(3, NumImagesToShow,NumImagesToShow + i + 1).set_title(title, fontsize=10)
             if i==0:
-                plt.subplot(4, NumImagesToShow, NumImagesToShow + i + 1).text(-50, 64, 'AE1')
+                plt.subplot(3, NumImagesToShow, NumImagesToShow + i + 1).text(-50, 64, 'AE')
             plt.imshow(decoded_imgsQ[i, :, :, :], interpolation='nearest')
             plt.axis(False)
         for i in range(NumImagesToShow):
-            #psnr = PSNR(xtest[i, :, :, :], decoded_imgsQ2[i, :, :, :])
-            psnr = ssim(xtest[i, :, :, 0], decoded_imgsQ2[i, :, :, 0],data_range=1.0)
-            psnr = psnr + ssim(xtest[i, :, :, 1], decoded_imgsQ2[i, :, :, 1],data_range=1.0)
-            psnr = psnr + ssim(xtest[i, :, :, 2], decoded_imgsQ2[i, :, :, 2],data_range=1.0)
-            psnr=psnr/3.0
-            #title = '%2.2f %2.2f' % (psnr, bpp2[i])
-            title = 'Q=%2.2f bpp=%2.2f' % (psnr, bpp2[i])
-            plt.subplot(4, NumImagesToShow, 2*NumImagesToShow + i + 1).set_title(title, fontsize=10)
-            if i==0:
-                plt.subplot(4, NumImagesToShow, 2*NumImagesToShow + i + 1).text(-50, 64, 'AE2')
-            plt.imshow(decoded_imgsQ2[i, :, :, :], interpolation='nearest')
-            plt.axis(False)
-        for i in range(NumImagesToShow):
             JPEGQP,JPEGrealbpp, JPEGrealpsnr = JPEGRDSingleImage(xtest[i, :, :, :], bpp[i],i)
-            JPEGfilename = 'image%i.jpeg' % i
+            JPEGfilename = './jpg/image%i.jpeg' % i
             JPEGimage = Image.open(JPEGfilename)
-            #title = '%2.2f %2.2f' % (JPEGrealpsnr,JPEGrealbpp)
             title = 'Q=%2.2f bpp=%2.2f' % (JPEGrealpsnr,JPEGrealbpp)
-            plt.subplot(4, NumImagesToShow, 3*NumImagesToShow + i + 1).set_title(title, fontsize=10)
+            plt.subplot(3, NumImagesToShow, 2*NumImagesToShow + i + 1).set_title(title, fontsize=10)
             if i==0:
-                plt.subplot(4, NumImagesToShow, 3*NumImagesToShow + i + 1).text(-50, 64, 'JPEG')
+                plt.subplot(3, NumImagesToShow, 2*NumImagesToShow + i + 1).text(-50, 64, 'JPEG')
             plt.imshow(JPEGimage, interpolation='nearest')
             plt.axis(False)
         plt.show()
