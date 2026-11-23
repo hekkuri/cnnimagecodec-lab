@@ -199,14 +199,14 @@ def ImageCodecModel(trainfolder, trainwithnoise, btrain):
     autoencoder.compile(optimizer='adam', loss=ssim_mse_loss)
     autoencoder.summary()
 
-    encname = './models/encoder_%i_%i.h5' % (trainwithnoise,btrain)
-    decname = './models/decoder_%i_%i.h5' % (trainwithnoise,btrain)
+    encname = './models/encoder_improved_%i_%i.h5' % (trainwithnoise, btrain)
+    decname = './models/decoder_improved_%i_%i.h5' % (trainwithnoise, btrain)
 
     if LoadModel == 0:
         print("Num GPUs Available: ", len(tensorflow.config.list_physical_devices('GPU')))
         xtrain = LoadImagesFromFolder(trainfolder)
         xtrain = xtrain / 255
-        with tensorflow.device('gpu'):    
+        with tensorflow.device('/GPU:0'):    
             history = autoencoder.fit(
                 xtrain, xtrain,
                 epochs=epochs,
