@@ -136,7 +136,14 @@ def residual_block(input_tensor, filters, kernel_size=(3, 3), strides=1, downsam
     x = layers.Add()([x, skip])
     return layers.Activation('relu')(x)
 
-def ImageCodecModel(trainfolder, trainwithnoise,btrain):
+# меняем лосс, чтобы он учитывал ssim
+def ssim_mse_loss(y_true, y_pred):
+    mse = tensorflow.reduce_mean(tensorflow.square(y_true - y_pred), axis=(1, 2, 3))
+    ssim_loss = 1.0 - tensorflow.image.ssim(y_true, y_pred, max_val=1.0)
+
+    return 0.7 * ssim_loss + 0.3 * mse
+
+def ImageCodecModel(trainfolder, trainwithnoise, btrain):
     input = layers.Input(shape=(w, h, 3))
     #Encoder
     x = layers.Conv2D(n1M1, (7, 7), padding='same')(input)
@@ -149,10 +156,14 @@ def ImageCodecModel(trainfolder, trainwithnoise,btrain):
 
     x = residual_block(x, n3M1, kernel_size=(3, 3))
     encoder_output = layers.AveragePooling2D((2, 2), padding='same')(x)
-
     # Add noise during training to simulate quantization
     if trainwithnoise == 1:
-        max_val = tensorflow.reduce_max(encoder_output)
+        max_val = tensorflow.reduce_max(
+            encoder_output,
+            axis=(1, 2, 3),
+            keepdims=True
+        ) # берем максимум для каждого изображения 
+        
         noise = tensorflow.random.uniform(
             shape=tensorflow.shape(encoder_output),
             minval=-1.0 / (2 ** (btrain + 1)),
@@ -185,7 +196,7 @@ def ImageCodecModel(trainfolder, trainwithnoise,btrain):
     decoder = Model(decoder_input, output, name='decoder')
     autoencoder = Model(input, output, name='autoencoder')
 
-    autoencoder.compile(optimizer='adam', loss='mean_squared_error')
+    autoencoder.compile(optimizer='adam', loss=ssim_mse_loss)
     autoencoder.summary()
 
     encname = './models/encoder_%i_%i.h5' % (trainwithnoise,btrain)
